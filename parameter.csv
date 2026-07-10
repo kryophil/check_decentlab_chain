@@ -1,0 +1,5 @@
+IN_PARAMETER_TX;OUT_SHORT_NAME_TX;DECIMALS_NU;VALUE_RANGE_MIN;VALUE_RANGE_MAX
+maxbotix-mb7386-distance;hyi435o0;0;0;10000
+maxbotix-mb7389-distance;hyi436o0;0;0;10000
+keller-pr36xiw-pressure;hyi437o0;6;-1;10
+keller-pr26d-pressure;hyi438o0;6;-1;10

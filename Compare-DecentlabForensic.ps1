@@ -390,13 +390,14 @@ if ($dbLoaded) {
             $nodeId = if ($StationMapR.ContainsKey($p[0])) { $StationMapR[$p[0]] } else { '?' }
             $keys = $byCombo[$combo] | Sort-Object
             Write-Host ""
-            Write-Host "    Station $($p[0]) (Node $nodeId) / $($p[1]): $($keys.Count) Records" -ForegroundColor Red
-            Write-Host ("      {0,-50} {1,-16} {2}" -f 'Inbound-File', 'TS', 'Wert')
-            Write-Host ("      " + ('-' * 80))
+            $sensorName = if ($ParamMapR.ContainsKey($p[1])) { $ParamMapR[$p[1]] } else { '?' }
+            Write-Host "    Station $($p[0]) (Node $nodeId) / $($p[1]) [$sensorName]: $($keys.Count) Records" -ForegroundColor Red
+            Write-Host ("      {0,-50} {1,-16} {2,-7} {3,-30} {4}" -f 'Inbound-File', 'TS', 'Node', 'Sensor', 'Wert')
+            Write-Host ("      " + ('-' * 110))
             foreach ($k in $keys) {
                 $kp = $k -split '\|'
                 $s = $InbSrc[$k]
-                Write-Host ("      {0,-50} {1,-16} {2}" -f $s.FilePath, $kp[2], $InbKeys[$k])
+                Write-Host ("      {0,-50} {1,-16} {2,-7} {3,-30} {4}" -f $s.FilePath, $kp[2], $s.Node, $s.Sensor, $InbKeys[$k])
             }
         }
     }

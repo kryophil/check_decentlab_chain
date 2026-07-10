@@ -292,7 +292,7 @@ foreach ($key in ($InbKeys.Keys | Sort-Object)) {
 
     $src = $InbSrc[$key]
     $inbFile   = $src.FilePath
-    $inbRecord = "node=$($src.Node);sensor=$($src.Sensor);ts=$($src.TsExact);value=$($src.Value)"
+    $inbRecord = "`"node=$($src.Node);sensor=$($src.Sensor);ts=$($src.TsExact);value=$($src.Value)`""
     $inParam   = $src.Sensor
     $stIn      = $src.Node
 
@@ -300,12 +300,12 @@ foreach ($key in ($InbKeys.Keys | Sort-Object)) {
     $archRecord = ''
     if ($inArchiv) {
         $archFile   = $ArchSrc[$key].File
-        $archRecord = $ArchSrc[$key].Line
+        $archRecord = "`"$($ArchSrc[$key].Line -replace '"','""')`""
     }
 
     $dbRecord = ''
     if ($dbLoaded -and $DbKeys.ContainsKey($key)) {
-        $dbRecord = $DbSrc[$key]
+        $dbRecord = "`"$($DbSrc[$key] -replace '"','""')`""
     }
 
     if (-not $inArchiv -and -not $inDb) { $missingBothCount++ }

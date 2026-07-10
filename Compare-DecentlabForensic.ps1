@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    Forensischer Record-Level-Vergleich: Archiv vs. Inbound vs. DB.
-    Keine Annahmen, keine Interpretation — nur harte Fakten pro Key.
+    Forensischer Record-Level-Vergleich: Inbound vs. Archiv vs. DB.
+    Erzeugt ein CSV mit allen Inbound-Werten, die im Archiv oder der DB fehlen.
 
 .DESCRIPTION
     Parst alle Inbound-JSONs und alle Archiv-Bulletins, baut je eine
     vollstaendige Key-Liste (Station|Parameter|YYYYMMDDHHmm00) auf,
-    und listet exakt auf, welche Keys wo fehlen.
-    Optional DB-Vergleich gegen das Archiv-Zeitfenster.
+    und exportiert ein CSV mit Detail-Informationen fuer alle Keys,
+    die im Inbound vorhanden sind, aber im Archiv oder in der DB fehlen.
 
 .PARAMETER BasePath
     Verzeichnis mit CSVs und Daten-Unterordnern.
@@ -17,12 +17,16 @@
 
 .PARAMETER DbCsv
     Alternativ: Pfad zu manuell exportierter CSV.
+
+.PARAMETER OutputCsv
+    Pfad fuer die Ausgabe-CSV. Default: missing_records.csv im BasePath.
 #>
 
 param(
     [string]$BasePath   = 'M:\zue-prod\data_integration\DWH_Hydro_Services\Test_Decentlab_API',
     [string]$OracleConn = '',
-    [string]$DbCsv      = ''
+    [string]$DbCsv      = '',
+    [string]$OutputCsv  = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +41,8 @@ $StationCsv   = Join-Path $BasePath 'station.csv'
 $ParameterCsv = Join-Path $BasePath 'parameter.csv'
 $BulletinCsv  = Join-Path $BasePath 'bulletin.csv'
 
+if ($OutputCsv -eq '') { $OutputCsv = Join-Path $BasePath 'missing_records.csv' }
+
 foreach ($p in @($InboundDir, $ArchiveDir, $StationCsv, $ParameterCsv, $BulletinCsv)) {
     if (-not (Test-Path $p)) { Write-Error "Nicht gefunden: $p"; return }
 }
@@ -47,9 +53,10 @@ Import-Csv $StationCsv -Delimiter ';' | ForEach-Object {
     $StationMapR[$_.STATION_OUT_TX] = $_.STATION_IN_TX
 }
 
-$ParamMap = @{}; $ParamRangeMin = @{}; $ParamRangeMax = @{}
+$ParamMap = @{}; $ParamMapR = @{}; $ParamRangeMin = @{}; $ParamRangeMax = @{}
 Import-Csv $ParameterCsv -Delimiter ';' | ForEach-Object {
     $ParamMap[$_.IN_PARAMETER_TX] = $_.OUT_SHORT_NAME_TX
+    $ParamMapR[$_.OUT_SHORT_NAME_TX] = $_.IN_PARAMETER_TX
     if ($_.PSObject.Properties.Name -contains 'VALUE_RANGE_MIN') {
         $ParamRangeMin[$_.OUT_SHORT_NAME_TX] = [double]$_.VALUE_RANGE_MIN
         $ParamRangeMax[$_.OUT_SHORT_NAME_TX] = [double]$_.VALUE_RANGE_MAX
@@ -68,9 +75,8 @@ Write-Host "  Stationen: $($StationMap.Count)  Parameter: $($ParamMap.Count)"
 # ============================================================
 Write-Host "`n=== Parse Inbound ===" -ForegroundColor Cyan
 
-# Key -> Wert (erster Wert pro Key bleibt, kein Ueberschreiben)
 $InbKeys = @{}
-# Key -> Quell-Info "folder|tsExact|node|sensor"
+# Key -> Hashtable mit Quell-Details
 $InbSrc  = @{}
 $InbTotal = 0; $InbOor = 0
 
@@ -104,7 +110,16 @@ foreach ($folder in $dtFolders) {
 
                     if (-not $InbKeys.ContainsKey($key)) {
                         $InbKeys[$key] = $value
-                        $InbSrc[$key]  = "$($folder.Name)|$tsExact|$node|$sensor"
+                        $InbSrc[$key] = @{
+                            Folder   = $folder.Name
+                            File     = $jf.Name
+                            FilePath = "$($folder.Name)/$($jf.Name)"
+                            TsExact  = $tsExact
+                            TsMs     = $tsMs
+                            Node     = $node
+                            Sensor   = $sensor
+                            Value    = $value
+                        }
                     }
                 }
             }
@@ -122,7 +137,6 @@ Write-Host "  Zeitbereich: $($inbTs[0]) - $($inbTs[-1])"
 Write-Host "`n=== Parse Archiv ===" -ForegroundColor Cyan
 
 $ArchKeys = @{}
-# Key -> Quell-Info "bulletin-filename"
 $ArchSrc  = @{}
 $ArchTotal = 0; $ArchOor = 0
 
@@ -151,7 +165,11 @@ foreach ($af in $archiveFiles) {
         $key = "$station|$param|$ts"
         if (-not $ArchKeys.ContainsKey($key)) {
             $ArchKeys[$key] = $value
-            $ArchSrc[$key]  = $af.Name
+            $ArchSrc[$key] = @{
+                File    = $af.Name
+                Line    = $line
+                LineNr  = $i + 1
+            }
         }
     }
 }
@@ -162,9 +180,9 @@ Write-Host "  Soll-Records: $ArchTotal  Out-of-Range: $ArchOor  Keys: $($ArchKey
 Write-Host "  Zeitbereich: $archTsMin - $archTsMax"
 
 # ============================================================
-# 4. DB laden (optional) — Zeitfenster = ARCHIV (nicht Inbound)
+# 4. DB laden (optional)
 # ============================================================
-$DbKeys = @{}; $dbLoaded = $false
+$DbKeys = @{}; $DbSrc = @{}; $dbLoaded = $false
 
 if ($OracleConn -ne '' -or $DbCsv -ne '') {
     Write-Host "`n=== Lade DB ===" -ForegroundColor Cyan
@@ -239,22 +257,78 @@ EXIT
             if ($refTs.Length -lt 12) { continue }
             $refTs = $refTs.Substring(0, 12) + '00'
             $key = "$($parts[0].Trim())|$($parts[1].Trim())|$refTs"
-            if (-not $DbKeys.ContainsKey($key)) { $DbKeys[$key] = $parts[3].Trim() }
+            if (-not $DbKeys.ContainsKey($key)) {
+                $DbKeys[$key] = $parts[3].Trim()
+                $DbSrc[$key] = "$($parts[0].Trim());$($parts[1].Trim());$refTs;$($parts[3].Trim())"
+            }
         }
         Write-Host "  DB-Keys (dedup): $($DbKeys.Count)"
         $dbLoaded = $true
     } else {
-        Write-Host "  WARNUNG: Keine DB-Daten geladen. Vergleich 2 wird uebersprungen." -ForegroundColor Yellow
-        if ($dbRecordsRaw) { Write-Host "  (dbRecordsRaw.Count = $($dbRecordsRaw.Count))" -ForegroundColor Yellow }
+        Write-Host "  WARNUNG: Keine DB-Daten geladen." -ForegroundColor Yellow
     }
 }
 
 # ============================================================
-# 5. Vergleich 1: INBOUND vs. ARCHIV (Key-Match)
-#    Nur innerhalb Inbound-Zeitfenster
+# 5. CSV erzeugen: Inbound-Keys die im Archiv ODER in DB fehlen
+# ============================================================
+Write-Host "`n=== Erzeuge CSV fuer fehlende Records ===" -ForegroundColor Cyan
+
+$csvLines = @()
+$csvLines += 'INBOUND_FILE;INBOUND_RECORD;IN_PARAMETER_TX;STATION_IN_TX;ARCHIVE_FILE;ARCHIVE_RECORD;OUT_SHORT_NAME_TX;STATION_OUT_TX;DB_RECORD'
+
+$missingArchCount = 0
+$missingDbCount = 0
+$missingBothCount = 0
+
+foreach ($key in ($InbKeys.Keys | Sort-Object)) {
+    $keyParts = $key -split '\|'
+    $stOut = $keyParts[0]; $parOut = $keyParts[1]; $tsTrunc = $keyParts[2]
+
+    $inArchiv = $ArchKeys.ContainsKey($key)
+    $inDb     = if ($dbLoaded) { $DbKeys.ContainsKey($key) } else { $true }
+
+    if ($inArchiv -and $inDb) { continue }
+
+    $src = $InbSrc[$key]
+    $inbFile   = $src.FilePath
+    $inbRecord = "node=$($src.Node);sensor=$($src.Sensor);ts=$($src.TsExact);value=$($src.Value)"
+    $inParam   = $src.Sensor
+    $stIn      = $src.Node
+
+    $archFile   = ''
+    $archRecord = ''
+    if ($inArchiv) {
+        $archFile   = $ArchSrc[$key].File
+        $archRecord = $ArchSrc[$key].Line
+    }
+
+    $dbRecord = ''
+    if ($dbLoaded -and $DbKeys.ContainsKey($key)) {
+        $dbRecord = $DbSrc[$key]
+    }
+
+    if (-not $inArchiv -and -not $inDb) { $missingBothCount++ }
+    elseif (-not $inArchiv) { $missingArchCount++ }
+    else { $missingDbCount++ }
+
+    $csvLines += "$inbFile;$inbRecord;$inParam;$stIn;$archFile;$archRecord;$parOut;$stOut;$dbRecord"
+}
+
+$totalMissing = $missingArchCount + $missingDbCount + $missingBothCount
+Write-Host "  Fehlend nur im Archiv: $missingArchCount"
+Write-Host "  Fehlend nur in DB:     $missingDbCount"
+Write-Host "  Fehlend in beidem:     $missingBothCount"
+Write-Host "  Total fehlende Keys:   $totalMissing"
+
+$csvLines -join "`r`n" | Out-File -FilePath $OutputCsv -Encoding UTF8
+Write-Host "`n  CSV geschrieben: $OutputCsv ($totalMissing Datensaetze)" -ForegroundColor Green
+
+# ============================================================
+# 6. Zusammenfassung auf Konsole (wie bisher)
 # ============================================================
 Write-Host "`n========================================================" -ForegroundColor White
-Write-Host "  VERGLEICH 1: INBOUND vs. ARCHIV (Key-Match)" -ForegroundColor White
+Write-Host "  VERGLEICH: INBOUND vs. ARCHIV (Key-Match)" -ForegroundColor White
 Write-Host "  Zeitfenster: $($inbTs[0]) - $($inbTs[-1])" -ForegroundColor White
 Write-Host "========================================================" -ForegroundColor White
 
@@ -273,12 +347,12 @@ foreach ($k in $ArchKeys.Keys) {
 
 Write-Host "`n  Im INBOUND, nicht im ARCHIV: $($inbNotArch.Count)" -ForegroundColor $(if ($inbNotArch.Count -gt 0) { 'Red' } else { 'Green' })
 if ($inbNotArch.Count -gt 0) {
-    Write-Host ("    {0,-46} {1,-16} {2,-7} {3,-10} {4,-10} {5}" -f 'Inbound-Ordner', 'TS exakt', 'Node', 'Station', 'Parameter', 'Wert')
+    Write-Host ("    {0,-46} {1,-16} {2,-7} {3,-10} {4,-10} {5}" -f 'Inbound-File', 'TS exakt', 'Node', 'Station', 'Parameter', 'Wert')
     Write-Host ("    " + ('-' * 100))
     foreach ($k in ($inbNotArch | Sort-Object)) {
-        $m = $InbSrc[$k] -split '\|'
+        $s = $InbSrc[$k]
         $p = $k -split '\|'
-        Write-Host ("    {0,-46} {1,-16} {2,-7} {3,-10} {4,-10} {5}" -f $m[0], $m[1], $m[2], $p[0], $p[1], $InbKeys[$k])
+        Write-Host ("    {0,-46} {1,-16} {2,-7} {3,-10} {4,-10} {5}" -f $s.FilePath, $s.TsExact, $s.Node, $p[0], $p[1], $InbKeys[$k])
     }
 }
 
@@ -288,35 +362,25 @@ if ($archNotInb.Count -gt 0) {
     Write-Host ("    " + ('-' * 100))
     foreach ($k in ($archNotInb | Sort-Object)) {
         $p = $k -split '\|'
-        Write-Host ("    {0,-50} {1,-10} {2,-10} {3,-16} {4}" -f $ArchSrc[$k], $p[0], $p[1], $p[2], $ArchKeys[$k])
+        Write-Host ("    {0,-50} {1,-10} {2,-10} {3,-16} {4}" -f $ArchSrc[$k].File, $p[0], $p[1], $p[2], $ArchKeys[$k])
     }
 }
 
-# ============================================================
-# 6. Vergleich 2: ARCHIV vs. DB (Key-Match)
-#    Ueber das GESAMTE Archiv-Zeitfenster
-# ============================================================
 if ($dbLoaded) {
     Write-Host "`n========================================================" -ForegroundColor White
-    Write-Host "  VERGLEICH 2: ARCHIV vs. DB (Key-Match)" -ForegroundColor White
+    Write-Host "  VERGLEICH: INBOUND vs. DB (Key-Match)" -ForegroundColor White
     Write-Host "  Zeitfenster: $archTsMin - $archTsMax" -ForegroundColor White
     Write-Host "========================================================" -ForegroundColor White
 
-    $archNotDb = @()
-    foreach ($k in $ArchKeys.Keys) {
-        if (-not $DbKeys.ContainsKey($k)) { $archNotDb += $k }
+    $inbNotDb = @()
+    foreach ($k in $InbKeys.Keys) {
+        if (-not $DbKeys.ContainsKey($k)) { $inbNotDb += $k }
     }
 
-    $dbNotArch = @()
-    foreach ($k in $DbKeys.Keys) {
-        if (-not $ArchKeys.ContainsKey($k)) { $dbNotArch += $k }
-    }
-
-    Write-Host "`n  Im ARCHIV, nicht in DB: $($archNotDb.Count)" -ForegroundColor $(if ($archNotDb.Count -gt 0) { 'Red' } else { 'Green' })
-    if ($archNotDb.Count -gt 0) {
-        # Gruppiert nach Station
+    Write-Host "`n  Im INBOUND, nicht in DB: $($inbNotDb.Count)" -ForegroundColor $(if ($inbNotDb.Count -gt 0) { 'Red' } else { 'Green' })
+    if ($inbNotDb.Count -gt 0) {
         $byCombo = @{}
-        foreach ($k in $archNotDb) {
+        foreach ($k in $inbNotDb) {
             $p = $k -split '\|'; $combo = "$($p[0])|$($p[1])"
             if (-not $byCombo.ContainsKey($combo)) { $byCombo[$combo] = @() }
             $byCombo[$combo] += $k
@@ -327,63 +391,13 @@ if ($dbLoaded) {
             $keys = $byCombo[$combo] | Sort-Object
             Write-Host ""
             Write-Host "    Station $($p[0]) (Node $nodeId) / $($p[1]): $($keys.Count) Records" -ForegroundColor Red
-            Write-Host ("      {0,-50} {1,-16} {2}" -f 'Bulletin', 'TS', 'Wert')
+            Write-Host ("      {0,-50} {1,-16} {2}" -f 'Inbound-File', 'TS', 'Wert')
             Write-Host ("      " + ('-' * 80))
             foreach ($k in $keys) {
                 $kp = $k -split '\|'
-                Write-Host ("      {0,-50} {1,-16} {2}" -f $ArchSrc[$k], $kp[2], $ArchKeys[$k])
+                $s = $InbSrc[$k]
+                Write-Host ("      {0,-50} {1,-16} {2}" -f $s.FilePath, $kp[2], $InbKeys[$k])
             }
-        }
-    }
-
-    Write-Host "`n  In DB, nicht im ARCHIV: $($dbNotArch.Count)" -ForegroundColor $(if ($dbNotArch.Count -gt 0) { 'Yellow' } else { 'Green' })
-    if ($dbNotArch.Count -gt 0) {
-        $byCombo = @{}
-        foreach ($k in $dbNotArch) {
-            $p = $k -split '\|'; $combo = "$($p[0])|$($p[1])"
-            if (-not $byCombo.ContainsKey($combo)) { $byCombo[$combo] = @() }
-            $byCombo[$combo] += $k
-        }
-        foreach ($combo in ($byCombo.Keys | Sort-Object)) {
-            $p = $combo -split '\|'
-            $nodeId = if ($StationMapR.ContainsKey($p[0])) { $StationMapR[$p[0]] } else { '?' }
-            $keys = $byCombo[$combo] | Sort-Object
-            Write-Host ""
-            Write-Host "    Station $($p[0]) (Node $nodeId) / $($p[1]): $($keys.Count) Records" -ForegroundColor Yellow
-            Write-Host ("      {0,-16} {1}" -f 'TS', 'DB-Wert')
-            Write-Host ("      " + ('-' * 30))
-            foreach ($k in $keys) {
-                $kp = $k -split '\|'
-                Write-Host ("      {0,-16} {1}" -f $kp[2], $DbKeys[$k])
-            }
-        }
-    }
-
-    # Zusammenfassung Archiv vs DB
-    Write-Host "`n  --- Zusammenfassung Archiv vs. DB ---" -ForegroundColor Cyan
-    $archNotDbCombos = @{}
-    foreach ($k in $archNotDb) {
-        $p = $k -split '\|'; $combo = "$($p[0])|$($p[1])"
-        if (-not $archNotDbCombos.ContainsKey($combo)) { $archNotDbCombos[$combo] = 0 }
-        $archNotDbCombos[$combo]++
-    }
-    Write-Host ("    {0,-8} {1,5} {2,-10} {3,8} {4,8} {5,10}" -f 'Station', 'Node', 'Parameter', 'Archiv', 'DB', 'Arch-DB')
-    Write-Host ("    " + ('-' * 55))
-    foreach ($stOut in ($StationMap.Values | Sort-Object)) {
-        foreach ($parOut in ($ParamMap.Values | Sort-Object)) {
-            $combo = "$stOut|$parOut"
-            $cArch = 0; $cDb = 0
-            foreach ($k in $ArchKeys.Keys) {
-                if ($k.StartsWith("$combo|")) { $cArch++ }
-            }
-            foreach ($k in $DbKeys.Keys) {
-                if ($k.StartsWith("$combo|")) { $cDb++ }
-            }
-            if ($cArch -eq 0 -and $cDb -eq 0) { continue }
-            $nodeId = if ($StationMapR.ContainsKey($stOut)) { $StationMapR[$stOut] } else { '?' }
-            $delta = $cDb - $cArch
-            $color = if ($delta -lt 0) { 'Red' } elseif ($delta -gt 0) { 'Yellow' } else { 'Green' }
-            Write-Host ("    {0,-8} {1,5} {2,-10} {3,8} {4,8} {5,10}" -f $stOut, $nodeId, $parOut, $cArch, $cDb, $delta) -ForegroundColor $color
         }
     }
 }
